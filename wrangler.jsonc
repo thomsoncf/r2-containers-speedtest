@@ -1,0 +1,55 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "r2-containers-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "containers": [
+    {
+      "name": "r2-speedtest-bench",
+      "class_name": "BenchContainer",
+      "image": "./container/Dockerfile",
+      "max_instances": 150,
+      // 4 vCPU, 12 GiB RAM, 20 GB disk -- account maximum per instance.
+      // Written as an explicit custom type (not "standard-4") because when we
+      // switched from a custom object to the named alias, wrangler retained
+      // the previous vcpu/memory_mib fields in its API PATCH and the API
+      // prioritized those over the alias -- containers came up with 1 vCPU.
+      // A fully-specified object avoids that ambiguity.
+      //
+      // Note: per-container throughput scales roughly per-vCPU (1 vCPU peaks
+      // ~1 Gbps, 4 vCPU peaks ~2.9 Gbps at --transfers 16); nr_throttled is
+      // 0 across a --transfers sweep 4..128 in both configs, so CFS isn't
+      // the constraint. 4 vCPU is the per-instance maximum and gives us the
+      // most per-container headroom while leaving CPU quota to spare.
+      "instance_type": {
+        "vcpu": 4,
+        "memory_mib": 12288,
+        "disk_mb": 20000
+      },
+      // Constrain placement to the ENAM region (same region as the R2
+      // bucket) so all downloads stay intra-region. Region is broader than
+      // an explicit city list; the platform is free to place across any
+      // ENAM colo which gives the best chance of scheduling 150 instances.
+      "constraints": {
+        "regions": ["enam"]
+      }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "BENCH", "class_name": "BenchContainer" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BenchContainer"] }
+  ]
+}

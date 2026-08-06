@@ -1,0 +1,13 @@
+# Copy to .dev.vars for local dev, or use `wrangler secret put` for production.
+# All four are required.
+
+# Your Cloudflare account ID (embedded in the R2 S3 endpoint).
+R2_ACCOUNT_ID=""
+
+# Name of the R2 bucket that holds the seeded 1.5 TB.
+R2_BUCKET="r2-containers-speedtest"
+
+# R2 API credentials with read access to the bucket.
+# Create at: Dashboard -> R2 -> Manage R2 API Tokens.
+R2_ACCESS_KEY_ID=""
+R2_SECRET_ACCESS_KEY=""

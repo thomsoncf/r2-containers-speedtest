@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>R2 Containers Speedtest</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #131922;
+      --border: #1f2833;
+      --fg: #e6edf3;
+      --muted: #7d8590;
+      --accent: #f38020;   /* Cloudflare orange */
+      --ok: #3fb950;
+      --warn: #d29922;
+      --err: #f85149;
+      --link: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--bg); color: var(--fg);
+      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      min-height: 100vh;
+    }
+    header {
+      padding: 22px 28px; border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: baseline;
+    }
+    header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+    header .sub { color: var(--muted); font-size: 13px; }
+    main { padding: 24px 28px; max-width: 1400px; margin: 0 auto; }
+
+    section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 18px; margin-bottom: 18px; }
+    section h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+    .controls { display: flex; gap: 18px; align-items: flex-end; flex-wrap: wrap; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { color: var(--muted); font-size: 12px; }
+    .field select, .field input {
+      background: #0d1219; color: var(--fg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 7px 10px; font: inherit; min-width: 100px;
+    }
+    button {
+      padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border);
+      background: #1c2431; color: var(--fg); font: inherit; cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #24314a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #14181d; font-weight: 600; }
+    button.primary:hover:not(:disabled) { background: #ff9840; border-color: #ff9840; }
+    button.danger { border-color: #5d2229; color: #ff8a91; }
+    button.danger:hover:not(:disabled) { background: #2a1418; }
+
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+    .stat { background: #0d1219; border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+    .stat .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat .value { font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .stat .sub { color: var(--muted); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+    .bar { height: 8px; background: #0d1219; border-radius: 4px; overflow: hidden; margin-top: 10px; }
+    .bar > div { height: 100%; background: var(--accent); transition: width 200ms linear; }
+
+    .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-size: 13px; }
+    .banner.warn { background: #3a2a10; border: 1px solid #6c4a15; color: #f7c268; }
+    .banner.err { background: #3a1418; border: 1px solid #6c1e26; color: #f7a0a5; }
+    .banner.ok { background: #10331a; border: 1px solid #1c5a2c; color: #7ee493; }
+
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 13px; }
+    th, td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border); }
+    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3) { text-align: left; }
+    th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+    tr:hover td { background: #171e2b; }
+
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .pill.idle { background: #1c2431; color: var(--muted); }
+    .pill.running { background: #163b25; color: #7ee493; }
+    .pill.done { background: #10331a; color: #3fb950; }
+    .pill.error { background: #3a1418; color: #f85149; }
+    .pill.unreach { background: #2a1a10; color: #d29922; }
+
+    .footnote { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    code { background: #0d1219; padding: 1px 5px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>R2 Containers Speedtest</h1>
+    <div class="sub" id="header-sub">loading…</div>
+  </header>
+
+  <main>
+    <div id="banners"></div>
+
+    <section>
+      <h2>Controls</h2>
+      <div class="controls">
+        <div class="field">
+          <label for="containerCount">Containers</label>
+          <select id="containerCount"></select>
+        </div>
+        <div class="field">
+          <label for="transfers">rclone --transfers</label>
+          <select id="transfers"></select>
+        </div>
+        <div class="field">
+          <label for="disableHttp2">HTTP</label>
+          <select id="disableHttp2">
+            <option value="true">HTTP/1.1 (recommended)</option>
+            <option value="false">HTTP/2 (rclone default)</option>
+          </select>
+        </div>
+        <button class="primary" id="btn-start">Start benchmark</button>
+        <button id="btn-reset">Reset (soft)</button>
+        <button class="danger" id="btn-hard-reset">Hard reset (destroy)</button>
+      </div>
+      <div class="footnote" id="controls-note"></div>
+    </section>
+
+    <section>
+      <h2>Aggregate</h2>
+      <div class="stats">
+        <div class="stat">
+          <div class="label">Aggregate throughput</div>
+          <div class="value" id="s-gbps">— Gbps</div>
+          <div class="sub" id="s-bps">— B/s</div>
+        </div>
+        <div class="stat">
+          <div class="label">Downloaded</div>
+          <div class="value" id="s-bytes">— / —</div>
+          <div class="bar"><div id="s-bar" style="width:0%"></div></div>
+          <div class="sub" id="s-pct">0.0%</div>
+        </div>
+        <div class="stat">
+          <div class="label">Elapsed</div>
+          <div class="value" id="s-elapsed">— s</div>
+          <div class="sub" id="s-eta">ETA —</div>
+        </div>
+        <div class="stat">
+          <div class="label">Containers</div>
+          <div class="value" id="s-counts">— running</div>
+          <div class="sub" id="s-counts-sub">— done, — unreachable</div>
+        </div>
+        <div class="stat">
+          <div class="label">Errors</div>
+          <div class="value" id="s-errors">0</div>
+          <div class="sub">across all shards</div>
+        </div>
+        <div class="stat">
+          <div class="label">CPU (p95 of 1 vCPU)</div>
+          <div class="value" id="s-cpu">—</div>
+          <div class="sub" id="s-cpu-sub">mean —</div>
+          <div class="sub" id="s-cpu-verdict" style="margin-top:6px;font-weight:600;"></div>
+        </div>
+        <div class="stat">
+          <div class="label">CFS throttle (p95)</div>
+          <div class="value" id="s-thr">—</div>
+          <div class="sub" id="s-thr-sub">mean —</div>
+          <div class="sub" id="s-thr-verdict" style="margin-top:6px;font-weight:600;"></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Per-container</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Colo</th>
+            <th>State</th>
+            <th>GB done</th>
+            <th>Gbps</th>
+            <th>CPU%</th>
+            <th>Threads</th>
+            <th>Transfers</th>
+            <th>Errors</th>
+            <th>Last msg</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </section>
+
+    <footer class="footnote" style="text-align: center; padding: 16px;">
+      Timing is <code>max(finishedAt) − min(startedAt)</code> across shards.
+      Aggregate Gbps = total bytes × 8 / elapsed.
+      Colo is best-effort from <code>cdn-cgi/trace</code>.
+    </footer>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmt = {
+      bytes(n) {
+        if (!Number.isFinite(n) || n < 0) return "—";
+        const u = ["B", "KB", "MB", "GB", "TB"];
+        let i = 0;
+        while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+        return `${n.toFixed(n >= 100 ? 0 : n >= 10 ? 1 : 2)} ${u[i]}`;
+      },
+      bps(n) {
+        if (!Number.isFinite(n) || n <= 0) return "0 B/s";
+        return `${this.bytes(n)}/s`;
+      },
+      gbps(n) { return `${(n || 0).toFixed(2)} Gbps`; },
+      secs(n) { return `${(n || 0).toFixed(1)} s`; },
+    };
+
+    let cfg = null;
+    let polling = false;
+    let pollTimer = null;
+    let currentCount = 50;
+
+    async function fetchJSON(url, init) {
+      const r = await fetch(url, init);
+      if (!r.ok) throw new Error(`${url} → ${r.status}`);
+      return r.json();
+    }
+
+    function updateControlsNote() {
+      const n = Number($("containerCount").value) || 1;
+      const perContainer = Math.round(cfg.totalFiles / n);
+      $("controls-note").innerHTML =
+        `Each container downloads a distinct shard of the ${cfg.totalFiles} files ` +
+        `(~${perContainer} per container at ${n}). ` +
+        `Sink is <code>rclone :memory,discard:</code> — nothing is written to disk.`;
+    }
+
+    async function loadConfig() {
+      cfg = await fetchJSON("/api/config");
+      const cc = $("containerCount");
+      cc.innerHTML = "";
+      for (const n of cfg.containerCounts) {
+        const opt = document.createElement("option");
+        opt.value = n; opt.textContent = n;
+        if (n === 50) opt.selected = true;
+        cc.appendChild(opt);
+      }
+      const t = $("transfers");
+      t.innerHTML = "";
+      for (const n of cfg.transfersOptions) {
+        const opt = document.createElement("option");
+        opt.value = n; opt.textContent = n;
+        if (n === 20) opt.selected = true;
+        t.appendChild(opt);
+      }
+      $("header-sub").textContent =
+        `${cfg.totalFiles} × ${fmt.bytes(cfg.fileSizeBytes)} = ${fmt.bytes(cfg.totalBytes)} in R2 (${cfg.placement})`;
+      updateControlsNote();
+      currentCount = Number(cc.value);
+    }
+
+    function banner(cls, html) {
+      const b = document.createElement("div");
+      b.className = `banner ${cls}`;
+      b.innerHTML = html;
+      $("banners").appendChild(b);
+    }
+
+    function clearBanners() { $("banners").innerHTML = ""; }
+
+    async function start() {
+      clearBanners();
+      const containerCount = Number($("containerCount").value);
+      const transfers = Number($("transfers").value);
+      const disableHttp2 = $("disableHttp2").value === "true";
+      currentCount = containerCount;
+
+      $("btn-start").disabled = true;
+      try {
+        const r = await fetchJSON("/api/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ containerCount, transfers, disableHttp2 }),
+        });
+        if (r.failed.length) {
+          banner("err",
+            `<b>${r.failed.length} of ${containerCount} containers failed to start.</b> ` +
+            `Common at high N — a colo in the constrained region may not have capacity. ` +
+            `Details: <code>${r.failed.map(f => `#${f.index}: ${f.error}`).join("; ").slice(0, 400)}</code>`);
+        }
+        if (r.started > 0) {
+          banner("ok", `Started <b>${r.started}</b> containers with <code>--transfers ${transfers}</code>, HTTP/${disableHttp2 ? "1.1" : "2"}.`);
+        }
+        startPolling();
+      } catch (e) {
+        banner("err", `Start failed: ${e.message}`);
+      } finally {
+        $("btn-start").disabled = false;
+      }
+    }
+
+    async function reset(hard) {
+      clearBanners();
+      $("btn-reset").disabled = true;
+      $("btn-hard-reset").disabled = true;
+      stopPolling();
+      try {
+        const r = await fetchJSON("/api/reset", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ containerCount: currentCount, hard }),
+        });
+        banner("ok", `Reset (${hard ? "hard" : "soft"}): ${r.ok}/${currentCount} OK.`);
+        await poll();
+      } catch (e) {
+        banner("err", `Reset failed: ${e.message}`);
+      } finally {
+        $("btn-reset").disabled = false;
+        $("btn-hard-reset").disabled = false;
+      }
+    }
+
+    function stopPolling() {
+      polling = false;
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    }
+
+    function startPolling() {
+      if (polling) return;
+      polling = true;
+      poll();
+    }
+
+    async function poll() {
+      try {
+        const s = await fetchJSON(`/api/status?n=${currentCount}`);
+        render(s);
+        if (polling && !s.allFinished) {
+          pollTimer = setTimeout(poll, 1000);
+        } else {
+          polling = false;
+        }
+      } catch (e) {
+        // Don't spam banners on transient poll failures; keep trying.
+        if (polling) pollTimer = setTimeout(poll, 2000);
+      }
+    }
+
+    function stateClass(state) {
+      switch (state) {
+        case "running": return "running";
+        case "done": return "done";
+        case "error": return "error";
+        default: return "idle";
+      }
+    }
+
+    function render(s) {
+      $("s-gbps").textContent = fmt.gbps(s.aggregateGbps);
+      $("s-bps").textContent = fmt.bps(s.aggregateBytesPerSec);
+      $("s-bytes").textContent = `${fmt.bytes(s.totalBytes)} / ${fmt.bytes(s.totalBytesTarget)}`;
+      const pct = s.totalBytesTarget > 0 ? (100 * s.totalBytes) / s.totalBytesTarget : 0;
+      $("s-bar").style.width = `${Math.min(100, pct).toFixed(2)}%`;
+      $("s-pct").textContent = `${pct.toFixed(1)}%`;
+      $("s-elapsed").textContent = fmt.secs(s.elapsed);
+      const remaining = s.totalBytesTarget - s.totalBytes;
+      const eta = s.aggregateBytesPerSec > 0 && !s.allFinished ? remaining / s.aggregateBytesPerSec : null;
+      $("s-eta").textContent = eta ? `ETA ${fmt.secs(eta)}` : (s.allFinished ? "done" : "ETA —");
+      $("s-counts").textContent = `${s.counts.running} running`;
+      $("s-counts-sub").textContent = `${s.counts.done} done · ${s.counts.error} error · ${s.counts.unreachable} unreachable · ${s.counts.idle} idle`;
+      $("s-errors").textContent = String(s.errors);
+
+      // CPU aggregate + verdict on whether we're CPU-bound.
+      const cpu = s.cpu;
+      if (cpu && cpu.samples > 0) {
+        $("s-cpu").textContent = `${cpu.p95Pct.toFixed(0)}%`;
+        $("s-cpu-sub").textContent = `mean ${cpu.meanPct.toFixed(0)}% · max ${cpu.maxPct.toFixed(0)}% · ${cpu.samples} samples`;
+        let verdict = "";
+        let color = "";
+        if (cpu.p95Pct >= 85) { verdict = "CPU-BOUND — obstore might help"; color = "var(--err)"; }
+        else if (cpu.p95Pct >= 50) { verdict = "CPU-heavy — mixed"; color = "var(--warn)"; }
+        else { verdict = "Not CPU-bound"; color = "var(--ok)"; }
+        const v = $("s-cpu-verdict");
+        v.textContent = verdict;
+        v.style.color = color;
+      } else {
+        $("s-cpu").textContent = "—";
+        $("s-cpu-sub").textContent = "no samples yet";
+        $("s-cpu-verdict").textContent = "";
+      }
+
+      // Throttle aggregate + verdict. This is the tiebreaker: if nr_throttled
+      // isn't climbing, CPU is genuinely not the ceiling regardless of pct.
+      const thr = s.throttle;
+      if (thr && thr.samples > 0) {
+        $("s-thr").textContent = `${thr.p95PctOfWindow.toFixed(1)}%`;
+        $("s-thr-sub").textContent = `mean ${thr.meanPctOfWindow.toFixed(1)}% · max ${thr.maxPctOfWindow.toFixed(1)}%`;
+        let vt = "", color = "";
+        if (thr.p95PctOfWindow >= 5 || thr.anyPeriodsThrottled) { vt = "THROTTLED — CPU is the cap"; color = "var(--err)"; }
+        else { vt = "No throttling — cap is elsewhere (network?)"; color = "var(--ok)"; }
+        const v = $("s-thr-verdict");
+        v.textContent = vt;
+        v.style.color = color;
+      } else {
+        $("s-thr").textContent = "—";
+        $("s-thr-sub").textContent = "no samples yet";
+        $("s-thr-verdict").textContent = "";
+      }
+
+      const tbody = $("rows");
+      tbody.innerHTML = "";
+      for (const sh of s.shards) {
+        const tr = document.createElement("tr");
+        if (!sh.reachable) {
+          tr.innerHTML = `
+            <td>${sh.index}</td>
+            <td>—</td>
+            <td><span class="pill unreach">${sh.containerState || "unreach"}</span></td>
+            <td>—</td>
+            <td>—</td>
+            <td>—</td>
+            <td>—</td>
+            <td>—</td>
+            <td>—</td>
+            <td>${(sh.error || "").slice(0, 80)}</td>`;
+        } else {
+          const cpuPct = sh.cpu && typeof sh.cpu.pctOfQuota === "number" ? sh.cpu.pctOfQuota.toFixed(0) + "%" : "—";
+          const threads = sh.cpu && sh.cpu.cgroupThreads !== null ? sh.cpu.cgroupThreads : "—";
+          tr.innerHTML = `
+            <td>${sh.index}</td>
+            <td>${sh.colo || "—"}</td>
+            <td><span class="pill ${stateClass(sh.state)}">${sh.state}</span></td>
+            <td>${fmt.bytes(sh.bytes)}</td>
+            <td>${((sh.speed * 8) / 1e9).toFixed(2)}</td>
+            <td>${cpuPct}</td>
+            <td>${threads}</td>
+            <td>${sh.transfersDone}/${sh.totalTransfers}</td>
+            <td>${sh.errors}</td>
+            <td style="max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${(sh.lastMsg || "").slice(0, 120)}</td>`;
+        }
+        tbody.appendChild(tr);
+      }
+    }
+
+    $("btn-start").addEventListener("click", start);
+    $("btn-reset").addEventListener("click", () => reset(false));
+    $("btn-hard-reset").addEventListener("click", () => {
+      if (confirm("Destroy all container instances? They'll cold-start and re-place on next run.")) reset(true);
+    });
+    $("containerCount").addEventListener("change", (e) => {
+      currentCount = Number(e.target.value);
+      updateControlsNote();
+    });
+
+    (async () => {
+      await loadConfig();
+      // Don't auto-poll on page load — polling would call /api/status which
+      // could nudge containers into the "check if running" path. Wait for
+      // an explicit Start / Reset click.
+    })();
+  </script>
+</body>
+</html>

@@ -64,9 +64,9 @@ Each container instance runs a small Python HTTP agent (see
 `container/agent.py`) which supervises `rclone copy r2:BUCKET :memory,discard:`
 and reports per-second stats parsed from rclone's NDJSON log.
 
---
+---
 
-## Results
+## Note
 
 Per-instance throughput scales with vCPU count
 

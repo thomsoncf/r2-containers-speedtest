@@ -68,11 +68,7 @@ and reports per-second stats parsed from rclone's NDJSON log.
 
 ## Results
 
-### Per-instance throughput scales with vCPU count
-
-Per-container throughput is not a fixed 1 Gbps per instance — it
-scales roughly linearly with vCPU count.
----
+Per-instance throughput scales with vCPU count
 
 ## Teardown
 

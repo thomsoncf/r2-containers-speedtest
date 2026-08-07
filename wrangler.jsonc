@@ -17,7 +17,7 @@
       "name": "r2-speedtest-bench",
       "class_name": "BenchContainer",
       "image": "./container/Dockerfile",
-      "max_instances": 150,
+      "max_instances": 200,
       // 4 vCPU, 12 GiB RAM, 20 GB disk -- account maximum per instance.
       // Written as an explicit custom type (not "standard-4") because when we
       // switched from a custom object to the named alias, wrangler retained
@@ -38,7 +38,7 @@
       // Constrain placement to the ENAM region (same region as the R2
       // bucket) so all downloads stay intra-region. Region is broader than
       // an explicit city list; the platform is free to place across any
-      // ENAM colo which gives the best chance of scheduling 150 instances.
+      // ENAM colo which gives the best chance of scheduling 200 instances.
       "constraints": {
         "regions": ["enam"]
       }

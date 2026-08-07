@@ -18,7 +18,7 @@
 // Auto-start subtlety
 // -------------------
 // The Container class's default fetch() auto-starts the container. That's
-// wrong for /api/status: opening the frontend would start all 150 containers
+// wrong for /api/status: opening the frontend would start all 200 containers
 // just from polling. We solve this by exposing three "/__*" control-plane
 // endpoints on the DO that inspect/manage state without triggering start.
 
@@ -27,12 +27,19 @@ import { Container, getContainer } from "@cloudflare/containers";
 // Fixed shape of the seeded dataset. If you change seed.mjs, change here.
 const TOTAL_FILES = 3000;
 const FILE_SIZE_BYTES = 500_000_000; // exactly 500 MB
-const TOTAL_BYTES = TOTAL_FILES * FILE_SIZE_BYTES; // exactly 1.5 TB
+const POOL_BYTES = TOTAL_FILES * FILE_SIZE_BYTES; // 1.5 TB pool
 const KEY_PREFIX = "bench/file-";
 const KEY_SUFFIX = ".bin";
 
+// Every container downloads this many files, sampled randomly from the pool
+// (without replacement within a container). With random sampling, different
+// containers may pick the same key -- that is intentional: it decouples the
+// per-container workload size from the fleet size, so runs can scale past
+// TOTAL_FILES / FILES_PER_CONTAINER (3000 / 20 = 150) without reseeding.
+const FILES_PER_CONTAINER = 20;
+
 // UI-selectable container counts. Must all be <= wrangler max_instances.
-const CONTAINER_COUNTS = [1, 10, 25, 50, 100, 150] as const;
+const CONTAINER_COUNTS = [1, 10, 25, 50, 100, 150, 200] as const;
 const MAX_CONTAINERS = CONTAINER_COUNTS[CONTAINER_COUNTS.length - 1];
 
 function buildKeyList(): string[] {
@@ -58,7 +65,7 @@ interface Env {
 
 export class BenchContainer extends Container<Env> {
   defaultPort = 8080;
-  sleepAfter = "10m";
+  sleepAfter = "3m";
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -262,13 +269,23 @@ async function resetShard(
   }
 }
 
-function shard(files: string[], n: number, index: number): string[] {
-  // Contiguous non-overlapping slices. Ensures every run moves the full 1.5 TB.
-  const base = Math.floor(files.length / n);
-  const extra = files.length % n;
-  const start = index * base + Math.min(index, extra);
-  const size = base + (index < extra ? 1 : 0);
-  return files.slice(start, start + size);
+function randomShard(files: string[], k: number): string[] {
+  // Sample k keys uniformly at random without replacement (per container).
+  // Different containers sample independently, so at high N the same key
+  // will be picked by more than one container -- accepted tradeoff to
+  // decouple per-container workload size from fleet size.
+  //
+  // Truncated Fisher-Yates: O(files.length) copy, O(k) work. For our
+  // sizes (files.length=3000, k=20) this is trivially cheap.
+  const arr = files.slice();
+  const kk = Math.min(k, arr.length);
+  for (let i = 0; i < kk; i++) {
+    const j = i + Math.floor(Math.random() * (arr.length - i));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr.slice(0, kk);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +303,9 @@ export default {
       return Response.json({
         totalFiles: TOTAL_FILES,
         fileSizeBytes: FILE_SIZE_BYTES,
-        totalBytes: TOTAL_BYTES,
+        poolBytes: POOL_BYTES,
+        filesPerContainer: FILES_PER_CONTAINER,
+        bytesPerContainer: FILES_PER_CONTAINER * FILE_SIZE_BYTES,
         containerCounts: CONTAINER_COUNTS,
         transfersOptions: [8, 16, 20, 32, 64, 128],
         // Purely display; must be kept in sync with wrangler.jsonc constraints.
@@ -314,14 +333,20 @@ export default {
       const files = buildKeyList();
       const runId = crypto.randomUUID();
 
-      // Fan out to N containers in parallel.
+      // Fan out to N containers in parallel. Each container gets an
+      // independently-sampled random shard of FILES_PER_CONTAINER keys.
       const results = await Promise.all(
-        Array.from({ length: n }, (_, i) => startShard(env, i, shard(files, n, i), transfers, disableHttp2)),
+        Array.from({ length: n }, (_, i) =>
+          startShard(env, i, randomShard(files, FILES_PER_CONTAINER), transfers, disableHttp2),
+        ),
       );
 
       return Response.json({
         runId,
         containerCount: n,
+        filesPerContainer: FILES_PER_CONTAINER,
+        bytesPerContainer: FILES_PER_CONTAINER * FILE_SIZE_BYTES,
+        runBytes: n * FILES_PER_CONTAINER * FILE_SIZE_BYTES,
         transfers,
         disableHttp2,
         started: results.filter((r) => r.ok).length,
@@ -430,7 +455,7 @@ export default {
         containerCount: n,
         counts: { running, done, error, idle, unreachable },
         totalBytes,
-        totalBytesTarget: TOTAL_BYTES,
+        totalBytesTarget: n * FILES_PER_CONTAINER * FILE_SIZE_BYTES,
         elapsed,
         aggregateBytesPerSec: aggBps,
         aggregateGbps: (aggBps * 8) / 1e9,

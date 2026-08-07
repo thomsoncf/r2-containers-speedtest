@@ -1,13 +1,16 @@
 # r2-containers-test
 
-Benchmark Cloudflare R2 download throughput from **up to 150 concurrent
+Benchmark Cloudflare R2 download throughput from **up to 200 concurrent
 Cloudflare Containers placed across the ENAM region**, backed by rclone
 into an in-memory discard sink. Frontend served by the Worker; click
 *Start* and watch the aggregate line.
 
 The bucket is seeded with **3000 × 500 MB objects = exactly 1.5 TB**. Each
-container gets a distinct shard (~20 files at N=150) and downloads it in
-parallel; the Worker aggregates per-shard stats into a live Gbps figure.
+container downloads **20 files (10 GB) sampled at random from the pool**,
+so different containers may pick the same key — this decouples the
+per-container workload from the pool size and lets the fleet scale past
+150 without reseeding. The Worker aggregates per-shard stats into a live
+Gbps figure.
 
 ---
 
@@ -56,7 +59,7 @@ and click **Start benchmark**.
 
 - **1 Worker** (`r2-containers-test`) serving the frontend and `/api/*`
 - **1 Container application** (`r2-speedtest-bench`), custom instance type
-  `{vcpu:4, memory_mib:12288, disk_mb:20000}`, `max_instances: 150`,
+  `{vcpu:4, memory_mib:12288, disk_mb:20000}`, `max_instances: 200`,
   `constraints.regions: ["enam"]`
 - **1 Durable Object class** (`BenchContainer`) with SQLite storage
 

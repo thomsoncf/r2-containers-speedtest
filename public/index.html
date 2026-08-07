@@ -221,10 +221,11 @@
 
     function updateControlsNote() {
       const n = Number($("containerCount").value) || 1;
-      const perContainer = Math.round(cfg.totalFiles / n);
+      const runBytes = n * cfg.bytesPerContainer;
       $("controls-note").innerHTML =
-        `Each container downloads a distinct shard of the ${cfg.totalFiles} files ` +
-        `(~${perContainer} per container at ${n}). ` +
+        `Each container downloads <b>${cfg.filesPerContainer}</b> random files ` +
+        `(${fmt.bytes(cfg.bytesPerContainer)}) from the pool of ${cfg.totalFiles}. ` +
+        `At ${n} containers that's <b>${fmt.bytes(runBytes)}</b> of R2 reads per run. ` +
         `Sink is <code>rclone :memory,discard:</code> — nothing is written to disk.`;
     }
 
@@ -247,7 +248,7 @@
         t.appendChild(opt);
       }
       $("header-sub").textContent =
-        `${cfg.totalFiles} × ${fmt.bytes(cfg.fileSizeBytes)} = ${fmt.bytes(cfg.totalBytes)} in R2 (${cfg.placement})`;
+        `${cfg.totalFiles} × ${fmt.bytes(cfg.fileSizeBytes)} = ${fmt.bytes(cfg.poolBytes)} in R2 (${cfg.placement})`;
       updateControlsNote();
       currentCount = Number(cc.value);
     }
@@ -269,6 +270,13 @@
       currentCount = containerCount;
 
       $("btn-start").disabled = true;
+      // Start polling before the fetch. /api/start awaits every container's
+      // cold start in one request; at high N that can outlive the client
+      // timeout. Polling reads /api/status which uses the non-auto-starting
+      // /__state path, so this is safe even before any container has booted.
+      // It guarantees the UI shows live progress regardless of what happens
+      // to the /api/start response.
+      startPolling();
       try {
         const r = await fetchJSON("/api/start", {
           method: "POST",
@@ -284,9 +292,8 @@
         if (r.started > 0) {
           banner("ok", `Started <b>${r.started}</b> containers with <code>--transfers ${transfers}</code>, HTTP/${disableHttp2 ? "1.1" : "2"}.`);
         }
-        startPolling();
       } catch (e) {
-        banner("err", `Start failed: ${e.message}`);
+        banner("err", `Start request error: ${e.message} — still polling in case containers are running. Use Reset to stop.`);
       } finally {
         $("btn-start").disabled = false;
       }

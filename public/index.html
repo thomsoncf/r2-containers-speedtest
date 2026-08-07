@@ -220,6 +220,29 @@
     let pollTimer = null;
     let currentCount = 50;
 
+    // ---- throughput-history tracking ----------------------------------
+    //
+    // Aggregate throughput on the tile is the *current* rate: delta
+    // totalBytes divided by delta wallclock between successive
+    // /api/status polls. The server-side aggregateBytesPerSec is a
+    // run-average (totalBytes / (now - minStart)) which is honest but
+    // decays at the tail -- once fast containers hit their 10 GB target
+    // totalBytes plateaus while rclone's shutdown drags the elapsed
+    // clock forward, and the displayed number keeps falling even though
+    // the run is effectively complete. The delta-based instantaneous
+    // figure doesn't have that problem.
+    //
+    // Resets on: config load, warm-start, and benchmark-start.
+    let prevBytes = null;      // totalBytes seen on the last poll
+    let prevAt = null;         // wallclock ms of the last poll
+    let instantBps = 0;        // most recent delta bytes / delta time
+
+    function resetThroughputHistory() {
+      prevBytes = null;
+      prevAt = null;
+      instantBps = 0;
+    }
+
     // ---- warm-state tracking ------------------------------------------
     //
     // A "warm" container has an HTTP agent listening on 8080 with clean
@@ -364,6 +387,12 @@
       const containerCount = Number($("containerCount").value);
       currentCount = containerCount;
 
+      // Warm resets fleet bytes to 0 (pre-reset + rate-limited reset).
+      // Any peak/instant carried from a prior run would compare bytes
+      // against a fresh baseline and produce a huge spurious delta on
+      // the first post-warm poll. Reset history now.
+      resetThroughputHistory();
+
       warmingInFlight = true;
       updateWarmStatus();
 
@@ -417,6 +446,10 @@
       const transfers = Number($("transfers").value);
       const disableHttp2 = $("disableHttp2").value === "true";
       currentCount = containerCount;
+
+      // Fresh run -- clear peak/instant so this run's headline reflects
+      // this run's delivery, not the last one's.
+      resetThroughputHistory();
 
       benchmarkInFlight = true;
       updateWarmStatus();
@@ -518,14 +551,52 @@
     }
 
     function render(s) {
-      $("s-gbps").textContent = fmt.gbps(s.aggregateGbps);
-      $("s-bps").textContent = fmt.bps(s.aggregateBytesPerSec);
+      // During warmup we keep polling so container-state tiles light up as
+      // instances come online, but any bytes returned in that window are
+      // stale carryover from a previous run -- Phase 0 (preResetUpContainers)
+      // has not necessarily finished zeroing them by the time the first
+      // poll returns. Force the byte-derived tiles to zero while
+      // warmingInFlight so the user never sees a flash of "1.5 TB / 2 TB"
+      // that then jumps back to zero.
+      if (warmingInFlight) {
+        s = { ...s, totalBytes: 0, aggregateBytesPerSec: 0, aggregateGbps: 0 };
+        // Also anchor the delta baseline to zero so the first post-warm
+        // poll doesn't compute a huge Δbytes and spike instant throughput.
+        prevBytes = 0;
+        prevAt = Date.now();
+        instantBps = 0;
+      }
+      // Instantaneous throughput: delta bytes since the last poll divided
+      // by delta wallclock. Requires two samples with a meaningful gap;
+      // we require >=250ms of dt to avoid divide-by-noise on back-to-back
+      // renders. Bytes can only rise, so guard against non-monotonic
+      // input (a soft-reset mid-run) by clamping negative deltas to 0.
+      const nowMs = Date.now();
+      if (prevBytes !== null && prevAt !== null) {
+        const dtMs = nowMs - prevAt;
+        if (dtMs >= 250) {
+          const dBytes = Math.max(0, s.totalBytes - prevBytes);
+          instantBps = (dBytes * 1000) / dtMs;
+          prevBytes = s.totalBytes;
+          prevAt = nowMs;
+        }
+      } else {
+        prevBytes = s.totalBytes;
+        prevAt = nowMs;
+      }
+      $("s-gbps").textContent = fmt.gbps((instantBps * 8) / 1e9);
+      $("s-bps").textContent = fmt.bps(instantBps);
       $("s-bytes").textContent = `${fmt.bytes(s.totalBytes)} / ${fmt.bytes(s.totalBytesTarget)}`;
-      const pct = s.totalBytesTarget > 0 ? (100 * s.totalBytes) / s.totalBytesTarget : 0;
-      $("s-bar").style.width = `${Math.min(100, pct).toFixed(2)}%`;
+      // Rclone's bytes counter can transiently exceed the per-shard
+      // target if it re-reads a range after a partial. Clamp the bar and
+      // the pct label at 100% so the UI doesn't display 100.4% at the
+      // tail; the raw bytes remain visible above.
+      const rawPct = s.totalBytesTarget > 0 ? (100 * s.totalBytes) / s.totalBytesTarget : 0;
+      const pct = Math.min(100, rawPct);
+      $("s-bar").style.width = `${pct.toFixed(2)}%`;
       $("s-pct").textContent = `${pct.toFixed(1)}%`;
       $("s-elapsed").textContent = fmt.secs(s.elapsed);
-      const remaining = s.totalBytesTarget - s.totalBytes;
+      const remaining = Math.max(0, s.totalBytesTarget - s.totalBytes);
       const eta = s.aggregateBytesPerSec > 0 && !s.allFinished ? remaining / s.aggregateBytesPerSec : null;
       $("s-eta").textContent = eta ? `ETA ${fmt.secs(eta)}` : (s.allFinished ? "done" : "ETA —");
       $("s-counts").textContent = `${s.counts.running} running`;

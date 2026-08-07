@@ -234,6 +234,38 @@ async function warmupShard(
   }
 }
 
+// Reset agent state on every container that is ALREADY up. Runs in
+// parallel over the whole fleet -- safe because /__state does not
+// auto-start containers, and we only issue /reset to containers whose
+// state check confirms they're up (so agentFetch's auto-start behavior
+// can't kick in here).
+//
+// The point: /api/status polls during the rate-limited warmup phase
+// below can otherwise observe stale STATE.bytes from a previous run
+// in any container reused within sleepAfter. Zeroing those before the
+// warmup dispatch starts eliminates the phantom "downloaded" figure
+// that showed up in the dashboard during warmup.
+async function preResetUpContainers(env: Env, n: number): Promise<number> {
+  let reset = 0;
+  await Promise.all(
+    Array.from({ length: n }, async (_, i) => {
+      try {
+        const st = await doControl(env, i, "/__state");
+        if (!st.ok) return;
+        const s = (await st.json()) as { state?: string };
+        if (s.state !== "running" && s.state !== "healthy") return;
+        // Container is up; safe to hit the agent without triggering
+        // an auto-start via getContainer's default fetch behavior.
+        const r = await agentFetch(env, i, "reset", { method: "POST" });
+        if (r.ok) reset++;
+      } catch {
+        // Ignore; the rate-limited warmup phase surfaces real failures.
+      }
+    }),
+  );
+  return reset;
+}
+
 // Warm every container in the fleet before starting the benchmark, pacing
 // dispatches at ratePerSec per second. Each /__ensureStart is fired without
 // awaiting completion, but their promises are collected and awaited at the
@@ -251,8 +283,15 @@ async function warmupFleet(
   warmed: number;
   failed: Array<{ index: number; error: string }>;
   elapsedMs: number;
+  preResetCount: number;
 }> {
   const startedAt = Date.now();
+
+  // Phase 0: clear stale STATE on any container already up. This closes
+  // the window where /api/status polling could otherwise sum leftover
+  // bytes from previous runs during the ~n/ratePerSec dispatch window.
+  const preResetCount = await preResetUpContainers(env, n);
+
   const pending: Promise<{ index: number; ok: boolean; error?: string }>[] = [];
 
   for (let i = 0; i < n; i++) {
@@ -269,7 +308,7 @@ async function warmupFleet(
   const failed = results
     .filter((r) => !r.ok)
     .map((r) => ({ index: r.index, error: r.error ?? "unknown" }));
-  return { warmed, failed, elapsedMs: Date.now() - startedAt };
+  return { warmed, failed, elapsedMs: Date.now() - startedAt, preResetCount };
 }
 
 // Kick off the rclone workload on a warm container. Assumes warmupShard
@@ -503,8 +542,17 @@ export default {
         }
         const s = r.status;
         anyStarted = anyStarted || s.startedAt !== null;
-        totalBytes += s.bytes;
-        liveErrors += s.errors;
+        // Only accumulate bytes when a run has been kicked off (agent
+        // reports startedAt). Freshly-reset containers have startedAt=null
+        // and bytes=0, but this guard also defends against reading a
+        // partially-reset snapshot where bytes hasn't been zeroed yet --
+        // no run has started for this session, so bytes cannot yet be
+        // meaningful. Prevents phantom "downloaded" figures during the
+        // warmup phase for containers reused from previous runs.
+        if (s.startedAt !== null) {
+          totalBytes += s.bytes;
+          liveErrors += s.errors;
+        }
         if (s.state === "running") { running++; anyRunning = true; }
         else if (s.state === "done") done++;
         else if (s.state === "error") error++;

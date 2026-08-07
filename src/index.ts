@@ -197,9 +197,21 @@ async function doControl(
   return stub.fetch(`http://c${path}`);
 }
 
-// Bring a container up and wait for port 8080 to be ready. Failure here
-// is a legitimate signal (colo capacity, image pull error) that we surface
-// verbatim rather than masking as a downstream network error.
+// Bring a container up and wait for port 8080 to be ready, then wipe any
+// stale agent state so the container is clean for the upcoming run.
+//
+// Why the reset is inside warmup, not just in /start:
+//   sleepAfter is 3m. A container reused within that window keeps its
+//   Python-level STATE from the previous run -- bytes, elapsed, "done"
+//   status. /api/status aggregates s.bytes unconditionally, so during
+//   the ~n/rate warmup window the dashboard would sum previous-run bytes
+//   across every reused container. The /start endpoint DOES reset STATE
+//   (agent.py) but that fires only in phase 2 -- too late to keep phase 1
+//   clean. Resetting during warmup closes that window.
+//
+// Failure of either step is a legitimate signal (colo capacity, image
+// pull error, agent crash) that we surface verbatim rather than masking
+// as a downstream connection error.
 async function warmupShard(
   env: Env,
   index: number,
@@ -208,6 +220,13 @@ async function warmupShard(
     const ensure = await doControl(env, index, "/__ensureStart");
     if (!ensure.ok) {
       return { index, ok: false, error: `ensureStart ${ensure.status}: ${(await ensure.text()).slice(0, 200)}` };
+    }
+    // POST /reset to the agent: kills any residual rclone process AND
+    // zeroes STATE (bytes, elapsed, startedAt, etc.). Idempotent -- safe
+    // to call on a freshly-booted agent as well.
+    const reset = await agentFetch(env, index, "reset", { method: "POST" });
+    if (!reset.ok) {
+      return { index, ok: false, error: `agent reset ${reset.status}: ${(await reset.text()).slice(0, 200)}` };
     }
     return { index, ok: true };
   } catch (e) {
@@ -372,6 +391,31 @@ export default {
       });
     }
 
+    // Warm the fleet: bring every container up, wait for HTTP-ready,
+    // and reset agent state so bytes/elapsed counters begin at zero.
+    // This is now a separate step from starting the benchmark so the
+    // user can (1) see progress and total warmup time explicitly and
+    // (2) run multiple back-to-back benchmarks without re-warming.
+    if (url.pathname === "/api/warmup" && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as {
+        containerCount?: number;
+      };
+      const requested = Number(body.containerCount ?? MAX_CONTAINERS);
+      const n = Number.isFinite(requested)
+        ? Math.max(1, Math.min(MAX_CONTAINERS, Math.floor(requested)))
+        : MAX_CONTAINERS;
+
+      const warmup = await warmupFleet(env, n, WARMUP_RATE_PER_SEC);
+
+      return Response.json({
+        containerCount: n,
+        warmed: warmup.warmed,
+        failed: warmup.failed,
+        elapsedMs: warmup.elapsedMs,
+        ratePerSec: WARMUP_RATE_PER_SEC,
+      });
+    }
+
     if (url.pathname === "/api/start" && request.method === "POST") {
       const body = (await request.json().catch(() => ({}))) as {
         containerCount?: number;
@@ -392,26 +436,15 @@ export default {
       const files = buildKeyList();
       const runId = crypto.randomUUID();
 
-      // Phase 1 -- warmup. Bring every container up to a listening HTTP
-      // agent before starting any rclone workload. Dispatches are rate-
-      // limited (WARMUP_RATE_PER_SEC per second) because firing all N
-      // ensureStart calls at once overwhelms the platform at high N.
-      const warmup = await warmupFleet(env, n, WARMUP_RATE_PER_SEC);
-
-      // Phase 2 -- start the rclone workload on every warm container in
-      // parallel. Each gets an independently-sampled random shard of
-      // FILES_PER_CONTAINER keys from the pool. Failed-warmup indices are
-      // short-circuited so the caller sees "warmup: ..." rather than a
-      // cryptic connection error.
-      const warmupFailedByIndex = new Map(warmup.failed.map((f) => [f.index, f.error]));
+      // Assumes containers are already warm (via /api/warmup). Each container
+      // gets an independently-sampled random shard of FILES_PER_CONTAINER
+      // keys from the pool. If an agent isn't reachable, startAgent surfaces
+      // that as a per-index failure rather than warming inline -- the caller
+      // can decide whether to re-warm or proceed.
       const starts = await Promise.all(
-        Array.from({ length: n }, (_, i) => {
-          const warmErr = warmupFailedByIndex.get(i);
-          if (warmErr) {
-            return Promise.resolve({ index: i, ok: false, error: `warmup: ${warmErr}` });
-          }
-          return startAgent(env, i, randomShard(files, FILES_PER_CONTAINER), transfers, disableHttp2);
-        }),
+        Array.from({ length: n }, (_, i) =>
+          startAgent(env, i, randomShard(files, FILES_PER_CONTAINER), transfers, disableHttp2),
+        ),
       );
 
       return Response.json({
@@ -422,12 +455,6 @@ export default {
         runBytes: n * FILES_PER_CONTAINER * FILE_SIZE_BYTES,
         transfers,
         disableHttp2,
-        warmup: {
-          warmed: warmup.warmed,
-          failed: warmup.failed.length,
-          elapsedMs: warmup.elapsedMs,
-          ratePerSec: WARMUP_RATE_PER_SEC,
-        },
         started: starts.filter((r) => r.ok).length,
         failed: starts.filter((r) => !r.ok),
       });

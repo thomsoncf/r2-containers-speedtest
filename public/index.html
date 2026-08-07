@@ -82,6 +82,11 @@
 
     .footnote { color: var(--muted); font-size: 12px; margin-top: 8px; }
     code { background: #0d1219; padding: 1px 5px; border-radius: 3px; }
+
+    .warm-pending { color: #f7c268; }
+    .warm-ok { color: #7ee493; }
+    .warm-stale { color: #d29922; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -111,10 +116,12 @@
             <option value="false">HTTP/2 (rclone default)</option>
           </select>
         </div>
-        <button class="primary" id="btn-start">Start benchmark</button>
+        <button id="btn-warm">Warm containers</button>
+        <button class="primary" id="btn-start" disabled>Start benchmark</button>
         <button id="btn-reset">Reset (soft)</button>
         <button class="danger" id="btn-hard-reset">Hard reset (destroy)</button>
       </div>
+      <div class="footnote" id="warm-status">Containers cold. Click <b>Warm containers</b> to bring the fleet up before running a benchmark.</div>
       <div class="footnote" id="controls-note"></div>
     </section>
 
@@ -213,6 +220,94 @@
     let pollTimer = null;
     let currentCount = 50;
 
+    // ---- warm-state tracking ------------------------------------------
+    //
+    // A "warm" container has an HTTP agent listening on 8080 with clean
+    // state (bytes=0, no rclone running). The benchmark can't start on a
+    // cold container. We track this client-side so Start is gated on
+    // completed warmup and back-to-back runs don't waste a warmup pass.
+    //
+    // Warm state invalidates when:
+    //  - The user hard-resets (containers destroyed)
+    //  - The user changes containerCount (a different subset must be warm)
+    //  - staleAge exceeds STALE_WARM_MS (containers may have slept)
+    //
+    // Note: sleepAfter is 3m; STALE_WARM_MS is a safety margin below that.
+    const STALE_WARM_MS = 150_000; // 2m30s -- rewarm well before sleepAfter=3m
+    let warmedAt = null;      // ms epoch of last successful warm, or null
+    let warmedCount = 0;      // how many containers were warmed
+    let warmedFailed = 0;     // how many failed to warm
+    let warmingInFlight = false;
+    let benchmarkInFlight = false;
+
+    function isWarmValid() {
+      if (warmedAt === null) return false;
+      if (Date.now() - warmedAt > STALE_WARM_MS) return false;
+      if (warmedCount !== currentCount) return false;
+      return true;
+    }
+
+    function updateWarmStatus() {
+      const el = $("warm-status");
+      const btnWarm = $("btn-warm");
+      const btnStart = $("btn-start");
+
+      if (warmingInFlight) {
+        el.innerHTML = `<span class="warm-pending">Warming ${currentCount} containers at ${cfg.warmupRatePerSec}/sec…</span>`;
+        btnWarm.disabled = true;
+        btnStart.disabled = true;
+        return;
+      }
+
+      if (benchmarkInFlight) {
+        el.innerHTML = `<span class="warm-ok">Benchmark in flight (${warmedCount} containers).</span>`;
+        btnWarm.disabled = true;
+        btnStart.disabled = true;
+        return;
+      }
+
+      if (warmedAt === null) {
+        el.innerHTML = `Containers cold. Click <b>Warm containers</b> to bring the fleet up before running a benchmark.`;
+        btnWarm.disabled = false;
+        btnStart.disabled = true;
+        return;
+      }
+
+      const ageMs = Date.now() - warmedAt;
+      const ageSec = Math.round(ageMs / 1000);
+      const ageLabel = ageSec < 60 ? `${ageSec}s ago` : `${Math.round(ageSec / 60)}m ago`;
+
+      if (ageMs > STALE_WARM_MS) {
+        el.innerHTML = `<span class="warm-stale">Warm state may be stale (${ageLabel}, sleepAfter is 3m). Re-warm before running.</span>`;
+        btnWarm.disabled = false;
+        btnStart.disabled = true;
+        return;
+      }
+
+      if (warmedCount !== currentCount) {
+        el.innerHTML = `<span class="warm-stale">Warmed ${warmedCount}, but selection is now ${currentCount}. Re-warm.</span>`;
+        btnWarm.disabled = false;
+        btnStart.disabled = true;
+        return;
+      }
+
+      const failedNote = warmedFailed > 0 ? ` (${warmedFailed} failed)` : "";
+      el.innerHTML = `<span class="warm-ok">${warmedCount} containers warm${failedNote} · warmed ${ageLabel}. Ready to benchmark.</span>`;
+      btnWarm.disabled = false;
+      btnStart.disabled = false;
+    }
+
+    function invalidateWarm() {
+      warmedAt = null;
+      warmedCount = 0;
+      warmedFailed = 0;
+      updateWarmStatus();
+    }
+
+    // Refresh the warm-status label every 5s so age counter and stale
+    // transition are visible without any user action.
+    setInterval(() => { if (cfg) updateWarmStatus(); }, 5000);
+
     async function fetchJSON(url, init) {
       const r = await fetch(url, init);
       if (!r.ok) throw new Error(`${url} → ${r.status}`);
@@ -227,8 +322,7 @@
         `Each container downloads <b>${cfg.filesPerContainer}</b> random files ` +
         `(${fmt.bytes(cfg.bytesPerContainer)}) from the pool of ${cfg.totalFiles}. ` +
         `At ${n} containers that's <b>${fmt.bytes(runBytes)}</b> of R2 reads per run. ` +
-        `Fleet warms up at <b>${cfg.warmupRatePerSec}/sec</b> (~${warmSecs}s dispatch) ` +
-        `before the benchmark starts. ` +
+        `Warmup takes ~<b>${warmSecs}s</b> at ${cfg.warmupRatePerSec}/sec. ` +
         `Sink is <code>rclone :memory,discard:</code> — nothing is written to disk.`;
     }
 
@@ -265,42 +359,80 @@
 
     function clearBanners() { $("banners").innerHTML = ""; }
 
+    async function warm() {
+      clearBanners();
+      const containerCount = Number($("containerCount").value);
+      currentCount = containerCount;
+
+      warmingInFlight = true;
+      updateWarmStatus();
+
+      const warmSecs = Math.ceil(containerCount / cfg.warmupRatePerSec);
+      banner("warn",
+        `Warming <b>${containerCount}</b> containers at <b>${cfg.warmupRatePerSec}/sec</b> ` +
+        `(~${warmSecs}s dispatch). Reset happens as part of warmup so agent state ` +
+        `starts clean.`);
+      // Poll during warmup so container states light up as they come online.
+      startPolling();
+      try {
+        const r = await fetchJSON("/api/warmup", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ containerCount }),
+        });
+        const failedCount = (r.failed || []).length;
+        warmedAt = Date.now();
+        warmedCount = r.warmed;
+        warmedFailed = failedCount;
+        const msg =
+          `Warmup complete: <b>${r.warmed}/${containerCount}</b> ready in ` +
+          `${(r.elapsedMs / 1000).toFixed(1)}s` +
+          (failedCount > 0 ? ` (${failedCount} failed)` : "");
+        banner(failedCount === 0 ? "ok" : "warn", msg);
+        if (failedCount > 0) {
+          banner("err",
+            `Failures: <code>${(r.failed || []).map(f => `#${f.index}: ${f.error}`).join("; ").slice(0, 400)}</code>`);
+        }
+      } catch (e) {
+        banner("err", `Warmup request error: ${e.message}`);
+        // Assume nothing is warm on request-level failure.
+        warmedAt = null;
+        warmedCount = 0;
+        warmedFailed = 0;
+      } finally {
+        warmingInFlight = false;
+        // Stop polling once warmup finishes; benchmark hasn't started yet.
+        stopPolling();
+        updateWarmStatus();
+      }
+    }
+
     async function start() {
+      if (!isWarmValid()) {
+        banner("err", "Containers are not warm (or warm state is stale). Click <b>Warm containers</b> first.");
+        return;
+      }
       clearBanners();
       const containerCount = Number($("containerCount").value);
       const transfers = Number($("transfers").value);
       const disableHttp2 = $("disableHttp2").value === "true";
       currentCount = containerCount;
 
-      $("btn-start").disabled = true;
-      // Start polling before the fetch. /api/start awaits every container's
-      // cold start in one request; at high N that can outlive the client
-      // timeout. Polling reads /api/status which uses the non-auto-starting
-      // /__state path, so this is safe even before any container has booted.
-      // It guarantees the UI shows live progress regardless of what happens
-      // to the /api/start response.
+      benchmarkInFlight = true;
+      updateWarmStatus();
+      // Start polling before the fetch so the UI shows live progress even
+      // if /api/start's response is slow.
       startPolling();
-      const warmSecs = Math.ceil(containerCount / cfg.warmupRatePerSec);
-      banner("warn",
-        `Warming <b>${containerCount}</b> containers at <b>${cfg.warmupRatePerSec}/sec</b> ` +
-        `(~${warmSecs}s dispatch). Benchmark begins once all are ready.`);
       try {
         const r = await fetchJSON("/api/start", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ containerCount, transfers, disableHttp2 }),
         });
-        if (r.warmup) {
-          const warmedMsg =
-            `Warmup: <b>${r.warmup.warmed}/${containerCount}</b> ready in ` +
-            `${(r.warmup.elapsedMs / 1000).toFixed(1)}s` +
-            (r.warmup.failed > 0 ? ` (${r.warmup.failed} failed)` : "");
-          banner(r.warmup.failed === 0 ? "ok" : "warn", warmedMsg);
-        }
         if (r.failed.length) {
           banner("err",
             `<b>${r.failed.length} of ${containerCount} containers failed to start.</b> ` +
-            `Common at high N — a colo in the constrained region may not have capacity. ` +
+            `If the error mentions "unreachable" the container likely slept; re-warm. ` +
             `Details: <code>${r.failed.map(f => `#${f.index}: ${f.error}`).join("; ").slice(0, 400)}</code>`);
         }
         if (r.started > 0) {
@@ -309,7 +441,12 @@
       } catch (e) {
         banner("err", `Start request error: ${e.message} — still polling in case containers are running. Use Reset to stop.`);
       } finally {
-        $("btn-start").disabled = false;
+        benchmarkInFlight = false;
+        // Refresh the warm timestamp: containers stay up after a run, so
+        // treating them as newly warm is honest and prevents the stale
+        // warning from tripping between quick successive runs.
+        warmedAt = Date.now();
+        updateWarmStatus();
       }
     }
 
@@ -325,6 +462,17 @@
           body: JSON.stringify({ containerCount: currentCount, hard }),
         });
         banner("ok", `Reset (${hard ? "hard" : "soft"}): ${r.ok}/${currentCount} OK.`);
+        if (hard) {
+          // Destroyed containers are no longer warm.
+          invalidateWarm();
+        } else {
+          // Soft reset clears agent state; containers stay up.
+          // Refresh warm timestamp so we don't nag about staleness immediately.
+          if (warmedAt !== null) {
+            warmedAt = Date.now();
+          }
+          updateWarmStatus();
+        }
         await poll();
       } catch (e) {
         banner("err", `Reset failed: ${e.message}`);
@@ -456,6 +604,7 @@
       }
     }
 
+    $("btn-warm").addEventListener("click", warm);
     $("btn-start").addEventListener("click", start);
     $("btn-reset").addEventListener("click", () => reset(false));
     $("btn-hard-reset").addEventListener("click", () => {
@@ -463,6 +612,9 @@
     });
     $("containerCount").addEventListener("change", (e) => {
       currentCount = Number(e.target.value);
+      // The warm subset [0, warmedCount) no longer matches the new selection.
+      // Explicitly invalidate rather than trying to reuse a partial warm.
+      invalidateWarm();
       updateControlsNote();
     });
 
@@ -470,7 +622,8 @@
       await loadConfig();
       // Don't auto-poll on page load — polling would call /api/status which
       // could nudge containers into the "check if running" path. Wait for
-      // an explicit Start / Reset click.
+      // an explicit Warm / Start / Reset click.
+      updateWarmStatus();
     })();
   </script>
 </body>

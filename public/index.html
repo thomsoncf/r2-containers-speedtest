@@ -222,10 +222,13 @@
     function updateControlsNote() {
       const n = Number($("containerCount").value) || 1;
       const runBytes = n * cfg.bytesPerContainer;
+      const warmSecs = Math.ceil(n / cfg.warmupRatePerSec);
       $("controls-note").innerHTML =
         `Each container downloads <b>${cfg.filesPerContainer}</b> random files ` +
         `(${fmt.bytes(cfg.bytesPerContainer)}) from the pool of ${cfg.totalFiles}. ` +
         `At ${n} containers that's <b>${fmt.bytes(runBytes)}</b> of R2 reads per run. ` +
+        `Fleet warms up at <b>${cfg.warmupRatePerSec}/sec</b> (~${warmSecs}s dispatch) ` +
+        `before the benchmark starts. ` +
         `Sink is <code>rclone :memory,discard:</code> — nothing is written to disk.`;
     }
 
@@ -277,12 +280,23 @@
       // It guarantees the UI shows live progress regardless of what happens
       // to the /api/start response.
       startPolling();
+      const warmSecs = Math.ceil(containerCount / cfg.warmupRatePerSec);
+      banner("warn",
+        `Warming <b>${containerCount}</b> containers at <b>${cfg.warmupRatePerSec}/sec</b> ` +
+        `(~${warmSecs}s dispatch). Benchmark begins once all are ready.`);
       try {
         const r = await fetchJSON("/api/start", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ containerCount, transfers, disableHttp2 }),
         });
+        if (r.warmup) {
+          const warmedMsg =
+            `Warmup: <b>${r.warmup.warmed}/${containerCount}</b> ready in ` +
+            `${(r.warmup.elapsedMs / 1000).toFixed(1)}s` +
+            (r.warmup.failed > 0 ? ` (${r.warmup.failed} failed)` : "");
+          banner(r.warmup.failed === 0 ? "ok" : "warn", warmedMsg);
+        }
         if (r.failed.length) {
           banner("err",
             `<b>${r.failed.length} of ${containerCount} containers failed to start.</b> ` +

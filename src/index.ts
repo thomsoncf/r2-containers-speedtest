@@ -42,6 +42,14 @@ const FILES_PER_CONTAINER = 20;
 const CONTAINER_COUNTS = [1, 10, 25, 50, 100, 150, 200] as const;
 const MAX_CONTAINERS = CONTAINER_COUNTS[CONTAINER_COUNTS.length - 1];
 
+// Warmup pacing: dispatch this many /__ensureStart calls per second.
+// Firing all N cold-starts at once overwhelms the containers platform at
+// high N (schedule failures, image pull contention). Spacing dispatches
+// keeps the burst under a rate the API tolerates while still finishing
+// warmup in seconds -- at 200 / 15 ≈ 13 seconds of dispatches, then the
+// container cold-start latencies overlap in flight.
+const WARMUP_RATE_PER_SEC = 15;
+
 function buildKeyList(): string[] {
   const keys: string[] = [];
   for (let i = 0; i < TOTAL_FILES; i++) {
@@ -189,7 +197,66 @@ async function doControl(
   return stub.fetch(`http://c${path}`);
 }
 
-async function startShard(
+// Bring a container up and wait for port 8080 to be ready. Failure here
+// is a legitimate signal (colo capacity, image pull error) that we surface
+// verbatim rather than masking as a downstream network error.
+async function warmupShard(
+  env: Env,
+  index: number,
+): Promise<{ index: number; ok: boolean; error?: string }> {
+  try {
+    const ensure = await doControl(env, index, "/__ensureStart");
+    if (!ensure.ok) {
+      return { index, ok: false, error: `ensureStart ${ensure.status}: ${(await ensure.text()).slice(0, 200)}` };
+    }
+    return { index, ok: true };
+  } catch (e) {
+    return { index, ok: false, error: String(e) };
+  }
+}
+
+// Warm every container in the fleet before starting the benchmark, pacing
+// dispatches at ratePerSec per second. Each /__ensureStart is fired without
+// awaiting completion, but their promises are collected and awaited at the
+// end so the caller knows every container is reachable (or has failed) by
+// the time this returns.
+//
+// Pacing shape: we dispatch a batch of ratePerSec calls, sleep 1 second,
+// dispatch the next batch, etc. Individual cold starts run in parallel;
+// only the *rate of new dispatches* is limited.
+async function warmupFleet(
+  env: Env,
+  n: number,
+  ratePerSec: number,
+): Promise<{
+  warmed: number;
+  failed: Array<{ index: number; error: string }>;
+  elapsedMs: number;
+}> {
+  const startedAt = Date.now();
+  const pending: Promise<{ index: number; ok: boolean; error?: string }>[] = [];
+
+  for (let i = 0; i < n; i++) {
+    pending.push(warmupShard(env, i));
+    // After each batch of ratePerSec dispatches, wait 1 s before the next.
+    // Skip the pause after the very last dispatch.
+    if ((i + 1) % ratePerSec === 0 && i < n - 1) {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  const results = await Promise.all(pending);
+  const warmed = results.filter((r) => r.ok).length;
+  const failed = results
+    .filter((r) => !r.ok)
+    .map((r) => ({ index: r.index, error: r.error ?? "unknown" }));
+  return { warmed, failed, elapsedMs: Date.now() - startedAt };
+}
+
+// Kick off the rclone workload on a warm container. Assumes warmupShard
+// has already succeeded for this index -- the agent HTTP server must be
+// listening. Failures here indicate a runtime problem, not a scheduling one.
+async function startAgent(
   env: Env,
   index: number,
   files: string[],
@@ -197,15 +264,6 @@ async function startShard(
   disableHttp2: boolean,
 ): Promise<{ index: number; ok: boolean; error?: string }> {
   try {
-    // Bring the container up first, waiting for port 8080. This can fail
-    // for legitimate reasons (colo capacity, image pull error), and we
-    // want that specific failure surfaced -- not masked as a start-post
-    // network error.
-    const ensure = await doControl(env, index, "/__ensureStart");
-    if (!ensure.ok) {
-      return { index, ok: false, error: `ensureStart ${ensure.status}: ${(await ensure.text()).slice(0, 200)}` };
-    }
-    // Then POST /start to the agent.
     const res = await agentFetch(env, index, "start", {
       method: "POST",
       body: JSON.stringify({ files, transfers, disableHttp2 }),
@@ -308,6 +366,7 @@ export default {
         bytesPerContainer: FILES_PER_CONTAINER * FILE_SIZE_BYTES,
         containerCounts: CONTAINER_COUNTS,
         transfersOptions: [8, 16, 20, 32, 64, 128],
+        warmupRatePerSec: WARMUP_RATE_PER_SEC,
         // Purely display; must be kept in sync with wrangler.jsonc constraints.
         placement: "ENAM region",
       });
@@ -333,12 +392,26 @@ export default {
       const files = buildKeyList();
       const runId = crypto.randomUUID();
 
-      // Fan out to N containers in parallel. Each container gets an
-      // independently-sampled random shard of FILES_PER_CONTAINER keys.
-      const results = await Promise.all(
-        Array.from({ length: n }, (_, i) =>
-          startShard(env, i, randomShard(files, FILES_PER_CONTAINER), transfers, disableHttp2),
-        ),
+      // Phase 1 -- warmup. Bring every container up to a listening HTTP
+      // agent before starting any rclone workload. Dispatches are rate-
+      // limited (WARMUP_RATE_PER_SEC per second) because firing all N
+      // ensureStart calls at once overwhelms the platform at high N.
+      const warmup = await warmupFleet(env, n, WARMUP_RATE_PER_SEC);
+
+      // Phase 2 -- start the rclone workload on every warm container in
+      // parallel. Each gets an independently-sampled random shard of
+      // FILES_PER_CONTAINER keys from the pool. Failed-warmup indices are
+      // short-circuited so the caller sees "warmup: ..." rather than a
+      // cryptic connection error.
+      const warmupFailedByIndex = new Map(warmup.failed.map((f) => [f.index, f.error]));
+      const starts = await Promise.all(
+        Array.from({ length: n }, (_, i) => {
+          const warmErr = warmupFailedByIndex.get(i);
+          if (warmErr) {
+            return Promise.resolve({ index: i, ok: false, error: `warmup: ${warmErr}` });
+          }
+          return startAgent(env, i, randomShard(files, FILES_PER_CONTAINER), transfers, disableHttp2);
+        }),
       );
 
       return Response.json({
@@ -349,8 +422,14 @@ export default {
         runBytes: n * FILES_PER_CONTAINER * FILE_SIZE_BYTES,
         transfers,
         disableHttp2,
-        started: results.filter((r) => r.ok).length,
-        failed: results.filter((r) => !r.ok),
+        warmup: {
+          warmed: warmup.warmed,
+          failed: warmup.failed.length,
+          elapsedMs: warmup.elapsedMs,
+          ratePerSec: WARMUP_RATE_PER_SEC,
+        },
+        started: starts.filter((r) => r.ok).length,
+        failed: starts.filter((r) => !r.ok),
       });
     }
 
